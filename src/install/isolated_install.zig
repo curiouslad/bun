@@ -173,7 +173,7 @@ pub fn installIsolatedPackages(
 
         // Peer-aware dedup: for packages WITH transitive peers, after all their
         // non-peer deps are recorded and peers resolved, check if a node with the
-        // same (pkg_id, peer_set) already exists. Reuse its children to avoid
+        // same (pkg_id, peer_set, parent_context) already exists. Reuse its children to avoid
         // exponential subtree re-expansion.
         //
         // Uses flat pooled structure with linked list: single ArrayList for all
@@ -181,10 +181,16 @@ pub fn installIsolatedPackages(
         // package. Hash map stores the head index for each PackageID. This avoids
         // many small heap allocations while maintaining O(K) iteration where K
         // is the number of entries for a package.
+        //
+        // NOTE: We include parent_id in the dedupe key because the peer-provider
+        // environment visible to descendants depends on the parent's context.
+        // Two nodes with the same pkg_id and peers but different parents may
+        // resolve peers differently for their descendants.
         const PeerDedupeEntry = struct {
             pkg_id: PackageID,
             node_id: Store.Node.Id,
             peers: Store.Node.Peers,
+            parent_id: Store.Node.Id, // parent context for dedupe key
             next: u32, // index of next entry for same package, or std.math.maxInt(u32) for end
         };
         var peer_dedupe_entries: std.ArrayListUnmanaged(PeerDedupeEntry) = .empty;
@@ -567,7 +573,7 @@ pub fn installIsolatedPackages(
             }
 
             // Flush deferred non-peer deps. For packages with transitive peers,
-            // check if a node with the same (pkg_id, peer_set) was already fully
+            // check if a node with the same (pkg_id, peer_set, parent_context) was already fully
             // expanded. If so, copy its child node list (which will cause the
             // second pass to dedup them) instead of re-expanding the subtree.
             if (deferred_deps.items.len > 0 or deferred_peers.items.len > 0) {
@@ -578,12 +584,15 @@ pub fn installIsolatedPackages(
                 };
 
                 var matched_node: ?Store.Node.Id = null;
-                // Check for existing entries for this package using linked list traversal
+                // Check for existing entries for this package using linked list traversal.
+                // We include parent_id in the comparison because the peer-provider
+                // environment visible to descendants depends on the parent's context.
                 if (peer_dedupe_heads.get(entry.pkg_id)) |head| {
                     var curr_idx = head;
                     while (curr_idx != std.math.maxInt(u32)) {
                         const info = peer_dedupe_entries.items[curr_idx];
-                        if (info.peers.eql(&curr_peers, &eql_ctx)) {
+                        // Match only if pkg_id, peers, AND parent context match
+                        if (info.parent_id == entry.parent_id and info.peers.eql(&curr_peers, &eql_ctx)) {
                             matched_node = info.node_id;
                             break;
                         }
@@ -606,7 +615,7 @@ pub fn installIsolatedPackages(
                     });
                     // Don't queue deferred_peers or deferred_deps — subtree already exists.
                 } else {
-                    // First time seeing this (pkg_id, peer_set). Record it and
+                    // First time seeing this (pkg_id, peer_set, parent_context). Record it and
                     // queue the deferred deps for normal expansion. Clone the
                     // peer list because the node's peers will be mutated later
                     // when child nodes insert transitive peers into ancestors.
@@ -616,6 +625,7 @@ pub fn installIsolatedPackages(
                         .pkg_id = entry.pkg_id,
                         .node_id = node_id,
                         .peers = .{ .list = try curr_peers.list.clone(lockfile.allocator) },
+                        .parent_id = entry.parent_id,
                         .next = prev_head,
                     });
                     try peer_dedupe_heads.put(lockfile.allocator, entry.pkg_id, new_idx);
@@ -635,10 +645,20 @@ pub fn installIsolatedPackages(
         // source node). This is fine because parent_id is only used during the
         // first-pass BFS. The second pass uses entry-level parentage.
         {
-            const node_nodes = nodes.slice().items(.nodes);
+            const nodes_slice_mut = nodes.slice();
+            const node_nodes = nodes_slice_mut.items(.nodes);
+            const node_peers_mut = nodes_slice_mut.items(.peers);
+            const peer_ctx: Store.Node.TransitivePeer.OrderedArraySetCtx = .{
+                .string_buf = string_buf,
+                .pkg_names = pkg_names,
+            };
             for (delayed_copies.items) |copy| {
                 for (node_nodes[copy.source.get()].items) |child_id| {
                     try node_nodes[copy.target.get()].append(lockfile.allocator, child_id);
+                }
+                // Sync peer metadata from source to target
+                for (node_peers_mut[copy.source.get()].slice()) |peer| {
+                    try node_peers_mut[copy.target.get()].insert(lockfile.allocator, peer, &peer_ctx);
                 }
             }
         }
