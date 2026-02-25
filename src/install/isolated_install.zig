@@ -136,19 +136,18 @@ pub fn installIsolatedPackages(
                 offsets: []const ReverseDepOffset,
 
                 fn getParents(self: @This(), child: PackageID) []const ReverseDepEdge {
-                    // Binary search for the child in offsets
-                    var left: usize = 0;
-                    var right: usize = self.offsets.len;
-                    while (left < right) {
-                        const mid = (left + right) / 2;
-                        if (self.offsets[mid].child < child) {
-                            left = mid + 1;
-                        } else {
-                            right = mid;
-                        }
-                    }
-                    if (left < self.offsets.len and self.offsets[left].child == child) {
-                        const off = self.offsets[left];
+                    const idx = std.sort.lowerBound(
+                        ReverseDepOffset,
+                        self.offsets,
+                        child,
+                        struct {
+                            fn order(key: PackageID, item: ReverseDepOffset) std.math.Order {
+                                return std.math.order(key, item.child);
+                            }
+                        }.order,
+                    );
+                    if (idx < self.offsets.len and self.offsets[idx].child == child) {
+                        const off = self.offsets[idx];
                         return self.edges[off.start..][0..off.len];
                     }
                     return &[_]ReverseDepEdge{};
@@ -629,6 +628,7 @@ pub fn installIsolatedPackages(
                     // This makes comparisons conservative (may miss some dedupes) but ensures correctness.
                     // Clone the peer list because the node's peers will be mutated later when child
                     // nodes insert transitive peers into ancestors.
+                    bun.debugAssert(peer_dedupe_entries.items.len <= std.math.maxInt(u32));
                     const new_idx: u32 = @intCast(peer_dedupe_entries.items.len);
                     const prev_head = peer_dedupe_heads.get(entry.pkg_id) orelse std.math.maxInt(u32);
                     try peer_dedupe_entries.append(lockfile.allocator, .{
