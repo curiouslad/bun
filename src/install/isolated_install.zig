@@ -397,7 +397,6 @@ pub fn installIsolatedPackages(
                 // For packages with transitive peers, defer queuing non-peer
                 // children until after peer resolution so we can check a
                 // (pkg_id, peer_set) dedup map before expanding subtrees.
-                const should_defer = has_transitive_peers;
 
                 for (dep_ids_sort_buf.items) |dep_id| {
                     if (Tree.isFilteredDependencyOrWorkspace(
@@ -420,7 +419,7 @@ pub fn installIsolatedPackages(
                     if (!dep.behavior.isPeer()) {
                         // Record as dependency (needed for peer resolution walk)
                         node_dependencies[node_id.get()].appendAssumeCapacity(.{ .dep_id = dep_id, .pkg_id = pkg_id });
-                        if (should_defer) {
+                        if (has_transitive_peers) {
                             // Defer queuing until after peer dedup check
                             try deferred_deps.append(lockfile.allocator, .{
                                 .parent_id = node_id,
@@ -576,6 +575,12 @@ pub fn installIsolatedPackages(
             // check if a node with the same (pkg_id, peer_set, parent_context) was already fully
             // expanded. If so, copy its child node list (which will cause the
             // second pass to dedup them) instead of re-expanding the subtree.
+            //
+            // NOTE: This condition skips packages where has_transitive_peers is true but all
+            // dependencies were filtered by isFilteredDependencyOrWorkspace, leaving both
+            // deferred_deps and deferred_peers empty. These nodes won't be added to
+            // peer_dedupe_entries, which is a known missed-deduplication case. Fixing this
+            // would require recording entries even when deferred_* are empty.
             if (deferred_deps.items.len > 0 or deferred_peers.items.len > 0) {
                 const curr_peers = nodes.items(.peers)[node_id.get()];
                 const eql_ctx: Store.Node.TransitivePeer.OrderedArraySetCtx = .{
@@ -616,9 +621,14 @@ pub fn installIsolatedPackages(
                     // Don't queue deferred_peers or deferred_deps — subtree already exists.
                 } else {
                     // First time seeing this (pkg_id, peer_set, parent_context). Record it and
-                    // queue the deferred deps for normal expansion. Clone the
-                    // peer list because the node's peers will be mutated later
-                    // when child nodes insert transitive peers into ancestors.
+                    // queue the deferred deps for normal expansion.
+                    //
+                    // NOTE: We intentionally store a snapshot of peers at enqueue time. Descendant
+                    // nodes may later insert transitive peers into node_peers[ancestor] (via
+                    // node_peers[...].insert), so the stored info.peers is a pre-descendant snapshot.
+                    // This makes comparisons conservative (may miss some dedupes) but ensures correctness.
+                    // Clone the peer list because the node's peers will be mutated later when child
+                    // nodes insert transitive peers into ancestors.
                     const new_idx: u32 = @intCast(peer_dedupe_entries.items.len);
                     const prev_head = peer_dedupe_heads.get(entry.pkg_id) orelse std.math.maxInt(u32);
                     try peer_dedupe_entries.append(lockfile.allocator, .{
